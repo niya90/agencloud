@@ -11,14 +11,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("core.config")
 
+from pydantic import model_validator
+
 class Settings(BaseSettings):
     PROJECT_ID: str = "niyati-463804"
     LOCATION: str = "us-central1"
-    DATASET_ID: str = "agent_ops_demo"
+    DATASET_ID: str = ""
     TABLE_ID: str = "agent_events"
     MODEL_NAME: str = "gemini-1.5-flash"
     PORT: int = 8000
     HOST: str = "0.0.0.0"
+
+    @model_validator(mode="after")
+    def set_dynamic_dataset_id(self) -> 'Settings':
+        if not self.DATASET_ID or self.DATASET_ID == "agent_ops_demo":
+            safe_project = self.PROJECT_ID.replace("-", "_")
+            self.DATASET_ID = f"agent_obsv_{safe_project}"
+        return self
 
     class Config:
         # Load from .env file checking current working directory, backend, and project root
