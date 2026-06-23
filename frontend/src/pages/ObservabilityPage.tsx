@@ -1,72 +1,129 @@
 import React, { useState, useMemo } from 'react';
-import { useObservability, ObservabilityRow } from '../hooks/useObservability';
+import { useObservability, InvocationMetrics, ObservabilityRow } from '../hooks/useObservability';
 
 export const ObservabilityPage: React.FC = () => {
-  const { logs, isLoading, error, limit, setLimit, autoRefresh, setAutoRefresh, refresh } = useObservability(100);
+  const { 
+    invocations, 
+    isLoading, 
+    error, 
+    limit, 
+    setLimit, 
+    autoRefresh, 
+    setAutoRefresh, 
+    refresh,
+    fetchInvocationEvents,
+    runRCA
+  } = useObservability(100);
+
   const [searchTerm, setSearchTerm] = useState('');
-  const [selectedEventType, setSelectedEventType] = useState('');
-  const [selectedLog, setSelectedLog] = useState<ObservabilityRow | null>(null);
+  const [selectedStatus, setSelectedStatus] = useState('');
+  const [selectedInvocation, setSelectedInvocation] = useState<InvocationMetrics | null>(null);
+  
+  // States for detailed raw events and RCA
+  const [rawEvents, setRawEvents] = useState<ObservabilityRow[]>([]);
+  const [isLoadingEvents, setIsLoadingEvents] = useState<boolean>(false);
+  const [rcaExplanation, setRcaExplanation] = useState<string | null>(null);
+  const [isLoadingRca, setIsLoadingRca] = useState<boolean>(false);
+  const [rcaError, setRcaError] = useState<string | null>(null);
+  const [expandedEventId, setExpandedEventId] = useState<string | null>(null);
 
-  // Event types for the filter dropdown
-  const eventTypes = useMemo(() => {
-    const types = new Set<string>();
-    logs.forEach(log => {
-      if (log.event_type) types.add(log.event_type);
-    });
-    return Array.from(types);
-  }, [logs]);
-
-  // Filtering logs
-  const filteredLogs = useMemo(() => {
-    return logs.filter(log => {
+  // Filtering invocations
+  const filteredInvocations = useMemo(() => {
+    return invocations.filter(inv => {
       const matchesSearch = 
-        (log.session_id?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
-        (log.invocation_id?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
-        (log.trace_id?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
-        (log.error_message?.toLowerCase().includes(searchTerm.toLowerCase()) || false);
+        (inv.session_id?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
+        (inv.invocation_id?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
+        (inv.query?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
+        (inv.response?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
+        (inv.error_message?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
+        (inv.tools_called?.toLowerCase().includes(searchTerm.toLowerCase()) || false);
       
-      const matchesType = selectedEventType ? log.event_type === selectedEventType : true;
+      const matchesStatus = selectedStatus 
+        ? inv.status === selectedStatus 
+        : true;
 
-      return matchesSearch && matchesType;
+      return matchesSearch && matchesStatus;
     });
-  }, [logs, searchTerm, selectedEventType]);
+  }, [invocations, searchTerm, selectedStatus]);
 
   // Statistics calculation
   const stats = useMemo(() => {
-    const total = filteredLogs.length;
-    const uniqueSessions = new Set(filteredLogs.map(l => l.session_id).filter(Boolean)).size;
+    const total = filteredInvocations.length;
+    const uniqueSessions = new Set(filteredInvocations.map(i => i.session_id).filter(Boolean)).size;
     
     // Success rate calculation
-    const successLogs = filteredLogs.filter(l => l.status === 'SUCCESS' || !l.error_message).length;
-    const successRate = total > 0 ? Math.round((successLogs / total) * 100) : 100;
+    const successCount = filteredInvocations.filter(i => i.status === 'OK').length;
+    const successRate = total > 0 ? Math.round((successCount / total) * 100) : 100;
 
-    // Latency calculations (parsing latency_ms JSON)
+    // Latency calculation
     let totalLatency = 0;
     let latencyCount = 0;
-    filteredLogs.forEach(l => {
-      if (l.latency_ms) {
-        let lat = 0;
-        if (typeof l.latency_ms === 'number') {
-          lat = l.latency_ms;
-        } else if (typeof l.latency_ms === 'object') {
-          // If stored as dict (e.g. {'total': 120})
-          lat = l.latency_ms.total || l.latency_ms.total_latency || 0;
-        }
-        if (lat > 0) {
-          totalLatency += lat;
-          latencyCount++;
-        }
+    filteredInvocations.forEach(i => {
+      if (i.total_latency_ms) {
+        totalLatency += i.total_latency_ms;
+        latencyCount++;
       }
     });
     const avgLatency = latencyCount > 0 ? Math.round(totalLatency / latencyCount) : 0;
+
+    // Token totals
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
+    filteredInvocations.forEach(i => {
+      if (i.input_tokens) totalPromptTokens += i.input_tokens;
+      if (i.output_tokens) totalCompletionTokens += i.output_tokens;
+    });
 
     return {
       total,
       uniqueSessions,
       successRate,
-      avgLatency
+      avgLatency,
+      totalPromptTokens,
+      totalCompletionTokens,
+      totalTokens: totalPromptTokens + totalCompletionTokens
     };
-  }, [filteredLogs]);
+  }, [filteredInvocations]);
+
+  const handleSelectInvocation = async (invocation: InvocationMetrics) => {
+    setSelectedInvocation(invocation);
+    setRawEvents([]);
+    setRcaExplanation(null);
+    setRcaError(null);
+    setExpandedEventId(null);
+    setIsLoadingEvents(true);
+    
+    try {
+      const events = await fetchInvocationEvents(invocation.invocation_id);
+      setRawEvents(events);
+    } catch (err) {
+      console.error("Failed to load raw events", err);
+    } finally {
+      setIsLoadingEvents(false);
+    }
+  };
+
+  const handleRunRca = async (invocationId: string) => {
+    setIsLoadingRca(true);
+    setRcaError(null);
+    setRcaExplanation(null);
+    try {
+      const explanation = await runRCA(invocationId);
+      setRcaExplanation(explanation);
+    } catch (err: any) {
+      setRcaError(err.message || 'Failed to run Root Cause Analysis');
+    } finally {
+      setIsLoadingRca(false);
+    }
+  };
+
+  const getStatusBadgeClass = (status?: string) => {
+    if (!status) return 'badge-secondary';
+    const s = status.toUpperCase();
+    if (s === 'OK' || s === 'SUCCESS') return 'badge-success';
+    if (s === 'ERROR' || s === 'FAILED') return 'badge-error';
+    return 'badge-secondary';
+  };
 
   const getEventBadgeClass = (type?: string) => {
     if (!type) return 'badge-secondary';
@@ -74,26 +131,50 @@ export const ObservabilityPage: React.FC = () => {
     if (t.includes('START') || t.includes('BEGIN')) return 'badge-info';
     if (t.includes('COMPLETE') || t.includes('END')) return 'badge-success';
     if (t.includes('TOOL') || t.includes('FUNCTION')) return 'badge-warning';
+    if (t.includes('ERROR')) return 'badge-error';
     return 'badge-secondary';
   };
 
-  const getStatusBadgeClass = (status?: string, errMsg?: string) => {
-    if (errMsg) return 'badge-error';
-    if (!status) return 'badge-secondary';
-    const s = status.toUpperCase();
-    if (s === 'SUCCESS') return 'badge-success';
-    if (s === 'ERROR' || s === 'FAILED') return 'badge-error';
-    return 'badge-secondary';
+  const formatStageName = (stage: string) => {
+    return stage
+      .replace('USER_MESSAGE_', '')
+      .replace('INVOCATION_', '')
+      .replace('AGENT_', '')
+      .replace('LLM_', '')
+      .replace('TOOL_', '');
   };
 
-  const formatLatency = (latField: any) => {
-    if (!latField) return '-';
-    if (typeof latField === 'number') return `${latField}ms`;
-    if (typeof latField === 'object') {
-      const lat = latField.total || latField.total_latency || latField.duration || null;
-      return lat ? `${lat}ms` : JSON.stringify(latField);
-    }
-    return String(latField);
+  // Helper to render basic markdown from model RCA
+  const renderMarkdown = (text: string) => {
+    return text.split('\n').map((line, idx) => {
+      if (line.startsWith('### ')) {
+        return <h5 key={idx} className="rca-h5">{line.substring(4)}</h5>;
+      }
+      if (line.startsWith('## ')) {
+        return <h4 key={idx} className="rca-h4">{line.substring(3)}</h4>;
+      }
+      if (line.startsWith('# ')) {
+        return <h3 key={idx} className="rca-h3">{line.substring(2)}</h3>;
+      }
+      if (line.trim().startsWith('* ') || line.trim().startsWith('- ')) {
+        return <li key={idx} className="rca-li">{line.replace(/^[\s*-]+/, '')}</li>;
+      }
+      if (line.startsWith('> ')) {
+        return <blockquote key={idx} className="rca-blockquote">{line.substring(2)}</blockquote>;
+      }
+      if (line.startsWith('```')) {
+        return null;
+      }
+      if (!line.trim()) return <div key={idx} style={{ height: '8px' }} />;
+      
+      let content: React.ReactNode = line;
+      if (line.includes('**')) {
+        const parts = line.split('**');
+        content = parts.map((part, i) => i % 2 === 1 ? <strong key={i}>{part}</strong> : part);
+      }
+      
+      return <p key={idx} className="rca-p">{content}</p>;
+    });
   };
 
   return (
@@ -102,29 +183,32 @@ export const ObservabilityPage: React.FC = () => {
       <div className="stats-grid">
         <div className="stat-card glass-panel">
           <div className="stat-info">
-            <span className="stat-title">Telemetry Events</span>
+            <span className="stat-title">Total Queries</span>
             <span className="stat-value">{stats.total}</span>
           </div>
           <div className="stat-icon cyan">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <line x1="18" y1="20" x2="18" y2="10"></line>
-              <line x1="12" y1="20" x2="12" y2="4"></line>
-              <line x1="6" y1="20" x2="6" y2="14"></line>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+              <line x1="16" y1="2" x2="16" y2="6"></line>
+              <line x1="8" y1="2" x2="8" y2="6"></line>
+              <line x1="3" y1="10" x2="21" y2="10"></line>
             </svg>
           </div>
         </div>
         
         <div className="stat-card glass-panel">
           <div className="stat-info">
-            <span className="stat-title">Active Sessions</span>
-            <span className="stat-value">{stats.uniqueSessions}</span>
+            <span className="stat-title">Tokens Consumed</span>
+            <span className="stat-value" style={{ fontSize: '1.4rem' }}>
+              {stats.totalTokens.toLocaleString()}
+            </span>
+            <span className="stat-sub-label">
+              In: {stats.totalPromptTokens.toLocaleString()} | Out: {stats.totalCompletionTokens.toLocaleString()}
+            </span>
           </div>
           <div className="stat-icon purple">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-              <circle cx="9" cy="7" r="4"></circle>
-              <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-              <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"></path>
             </svg>
           </div>
         </div>
@@ -135,7 +219,7 @@ export const ObservabilityPage: React.FC = () => {
             <span className="stat-value">{stats.successRate}%</span>
           </div>
           <div className="stat-icon green">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path>
               <polyline points="22 4 12 14.01 9 11.01"></polyline>
             </svg>
@@ -144,11 +228,11 @@ export const ObservabilityPage: React.FC = () => {
 
         <div className="stat-card glass-panel">
           <div className="stat-info">
-            <span className="stat-title">Average Latency</span>
-            <span className="stat-value">{stats.avgLatency > 0 ? `${stats.avgLatency}ms` : '-'}</span>
+            <span className="stat-title">Avg Latency</span>
+            <span className="stat-value">{stats.avgLatency > 0 ? `${(stats.avgLatency / 1000).toFixed(2)}s` : '-'}</span>
           </div>
           <div className="stat-icon gold">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <circle cx="12" cy="12" r="10"></circle>
               <polyline points="12 6 12 12 16 14"></polyline>
             </svg>
@@ -161,20 +245,19 @@ export const ObservabilityPage: React.FC = () => {
         <div className="search-group">
           <input
             type="text"
-            placeholder="Search by Session, Trace, or Error..."
+            placeholder="Search by query, response, session, or tool..."
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             className="search-input"
           />
           <select
-            value={selectedEventType}
-            onChange={(e) => setSelectedEventType(e.target.value)}
+            value={selectedStatus}
+            onChange={(e) => setSelectedStatus(e.target.value)}
             className="filter-select"
           >
-            <option value="">All Event Types</option>
-            {eventTypes.map(t => (
-              <option key={t} value={t}>{t}</option>
-            ))}
+            <option value="">All Statuses</option>
+            <option value="OK">Succeeded (OK)</option>
+            <option value="ERROR">Failed (ERROR)</option>
           </select>
         </div>
 
@@ -188,7 +271,7 @@ export const ObservabilityPage: React.FC = () => {
               />
               <span className="slider round"></span>
             </label>
-            <span className="toggle-label">Auto-Refresh (5s)</span>
+            <span className="toggle-label">Auto-Refresh</span>
           </div>
 
           <select
@@ -205,7 +288,7 @@ export const ObservabilityPage: React.FC = () => {
             {isLoading ? (
               <span className="spinner"></span>
             ) : (
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" style={{ marginRight: '6px' }}>
                 <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
               </svg>
             )}
@@ -214,52 +297,84 @@ export const ObservabilityPage: React.FC = () => {
         </div>
       </div>
 
-      {/* Logs Table */}
+      {/* Invocations Table */}
       <div className="table-wrapper glass-panel">
         {error && <div className="error-banner">Error: {error}</div>}
         
         <table className="logs-table">
           <thead>
             <tr>
-              <th>Timestamp</th>
-              <th>Event Type</th>
-              <th>Agent</th>
+              <th>Start Time</th>
               <th>Session ID</th>
-              <th>Status</th>
+              <th>User Query</th>
+              <th>Execution Stages</th>
+              <th>Tokens (In/Out)</th>
               <th>Latency</th>
-              <th>Trace ID</th>
+              <th>Tools</th>
+              <th>Status</th>
             </tr>
           </thead>
           <tbody>
-            {filteredLogs.length === 0 ? (
+            {filteredInvocations.length === 0 ? (
               <tr>
-                <td colSpan={7} className="no-data">
-                  {isLoading ? 'Fetching telemetry from BigQuery...' : 'No telemetry logs found matching filters.'}
+                <td colSpan={8} className="no-data">
+                  {isLoading ? 'Querying trace log metrics from BigQuery...' : 'No telemetry traces found.'}
                 </td>
               </tr>
             ) : (
-              filteredLogs.map((log, index) => (
-                <tr key={`${log.invocation_id}-${index}`} onClick={() => setSelectedLog(log)} className="log-row">
+              filteredInvocations.map((inv, index) => (
+                <tr key={`${inv.invocation_id}-${index}`} onClick={() => handleSelectInvocation(inv)} className="log-row">
                   <td className="timestamp-cell">
-                    {new Date(log.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'})}
+                    {new Date(inv.start_time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'})}
                     <span className="date-sub">
-                      {new Date(log.timestamp).toLocaleDateString([], {month: 'short', day: 'numeric'})}
+                      {new Date(inv.start_time).toLocaleDateString([], {month: 'short', day: 'numeric'})}
                     </span>
+                  </td>
+                  <td><code className="session-code" title={inv.session_id}>{inv.session_id?.substring(0, 8)}...</code></td>
+                  <td className="query-cell" title={inv.query}>
+                    {inv.query ? (inv.query.length > 50 ? `${inv.query.substring(0, 50)}...` : inv.query) : <span className="empty-sub">No user query</span>}
                   </td>
                   <td>
-                    <span className={`badge ${getEventBadgeClass(log.event_type)}`}>
-                      {log.event_type || 'UNKNOWN'}
-                    </span>
+                    <div className="stages-badge-container">
+                      {inv.stages.slice(0, 5).map((stage, sIdx) => (
+                        <span key={sIdx} className={`stage-mini-badge ${getEventBadgeClass(stage)}`}>
+                          {formatStageName(stage)}
+                        </span>
+                      ))}
+                      {inv.stages.length > 5 && (
+                        <span className="stage-mini-badge badge-secondary">
+                          +{inv.stages.length - 5} more
+                        </span>
+                      )}
+                    </div>
                   </td>
-                  <td><code>{log.agent || '-'}</code></td>
-                  <td><code className="session-code" title={log.session_id}>{log.session_id?.substring(0, 8)}...</code></td>
                   <td>
-                    <span className={`badge ${getStatusBadgeClass(log.status, log.error_message)}`}>
-                      {log.error_message ? 'ERROR' : log.status || 'SUCCESS'}
+                    <span className="token-metric">
+                      <strong>{inv.total_tokens || 0}</strong>
+                      <span className="token-sub">
+                        {inv.input_tokens || 0} / {inv.output_tokens || 0}
+                      </span>
                     </span>
                   </td>
-                  <td>{formatLatency(log.latency_ms)}</td>
-                  <td><code className="trace-code" title={log.trace_id}>{log.trace_id?.substring(0, 8)}...</code></td>
+                  <td>{inv.total_latency_ms ? `${(inv.total_latency_ms / 1000).toFixed(2)}s` : '-'}</td>
+                  <td>
+                    {inv.tools_called ? (
+                      <div className="tools-badge-container">
+                        {Array.from(new Set(inv.tools_called.split(', '))).map((t, tIdx) => (
+                          <span key={tIdx} className="tool-chip">
+                            {t}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="empty-sub">None</span>
+                    )}
+                  </td>
+                  <td>
+                    <span className={`badge ${getStatusBadgeClass(inv.status)}`}>
+                      {inv.status || 'OK'}
+                    </span>
+                  </td>
                 </tr>
               ))
             )}
@@ -267,86 +382,158 @@ export const ObservabilityPage: React.FC = () => {
         </table>
       </div>
 
-      {/* Log Details Modal */}
-      {selectedLog && (
-        <div className="modal-overlay" onClick={() => setSelectedLog(null)}>
+      {/* Invocation Details Drawer / Modal */}
+      {selectedInvocation && (
+        <div className="modal-overlay" onClick={() => setSelectedInvocation(null)}>
           <div className="modal-content glass-panel" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>Telemetry Details</h3>
-              <button className="close-btn" onClick={() => setSelectedLog(null)}>&times;</button>
+              <div>
+                <h3>Trace Execution Details</h3>
+                <span className="invocation-sub-header">Invocation ID: <code>{selectedInvocation.invocation_id}</code></span>
+              </div>
+              <button className="close-btn" onClick={() => setSelectedInvocation(null)}>&times;</button>
             </div>
             
             <div className="modal-body">
+              {/* Detailed Grid */}
               <div className="details-grid">
                 <div className="detail-item">
-                  <span className="detail-label">Timestamp</span>
-                  <span className="detail-val">{new Date(selectedLog.timestamp).toString()}</span>
-                </div>
-                <div className="detail-item">
-                  <span className="detail-label">Event Type</span>
-                  <span className={`badge ${getEventBadgeClass(selectedLog.event_type)}`}>{selectedLog.event_type}</span>
+                  <span className="detail-label">Start Time</span>
+                  <span className="detail-val">{new Date(selectedInvocation.start_time).toString()}</span>
                 </div>
                 <div className="detail-item">
                   <span className="detail-label">Session ID</span>
-                  <code className="detail-val">{selectedLog.session_id}</code>
-                </div>
-                <div className="detail-item">
-                  <span className="detail-label">Invocation ID</span>
-                  <code className="detail-val">{selectedLog.invocation_id}</code>
-                </div>
-                <div className="detail-item">
-                  <span className="detail-label">Trace ID</span>
-                  <code className="detail-val">{selectedLog.trace_id}</code>
-                </div>
-                <div className="detail-item">
-                  <span className="detail-label">Agent</span>
-                  <span className="detail-val">{selectedLog.agent || '-'}</span>
+                  <code className="detail-val">{selectedInvocation.session_id}</code>
                 </div>
                 <div className="detail-item">
                   <span className="detail-label">Latency</span>
-                  <span className="detail-val">{JSON.stringify(selectedLog.latency_ms) || '-'}</span>
+                  <span className="detail-val">{selectedInvocation.total_latency_ms ? `${(selectedInvocation.total_latency_ms / 1000).toFixed(2)}s (${selectedInvocation.total_latency_ms} ms)` : '-'}</span>
                 </div>
                 <div className="detail-item">
-                  <span className="detail-label">Status</span>
-                  <span className={`badge ${getStatusBadgeClass(selectedLog.status, selectedLog.error_message)}`}>
-                    {selectedLog.status || 'SUCCESS'}
+                  <span className="detail-label">Tokens Consumed</span>
+                  <span className="detail-val">
+                    <strong>{selectedInvocation.total_tokens || 0}</strong> (In: {selectedInvocation.input_tokens || 0} | Out: {selectedInvocation.output_tokens || 0})
                   </span>
                 </div>
               </div>
 
-              {selectedLog.error_message && (
-                <div className="error-panel">
-                  <h4>Error Stack Trace</h4>
-                  <pre className="error-message">{selectedLog.error_message}</pre>
+              {/* User Query and Response */}
+              <div className="query-response-panel">
+                <div className="qr-box user-query">
+                  <h5>User Query</h5>
+                  <p>{selectedInvocation.query || 'N/A'}</p>
                 </div>
-              )}
+                <div className="qr-box agent-response">
+                  <h5>Agent Response</h5>
+                  <p>{selectedInvocation.response || 'N/A'}</p>
+                </div>
+              </div>
 
-              {selectedLog.content && (
-                <div className="json-panel">
-                  <h4>Event Content Payload</h4>
-                  <pre className="code-block">
-                    {JSON.stringify(selectedLog.content, null, 2)}
-                  </pre>
+              {/* Root Cause Analysis (RCA) Section */}
+              <div className="rca-container glass-panel">
+                <div className="rca-header">
+                  <h4>AI-Powered Trace Analysis & RCA</h4>
+                  {!rcaExplanation && !isLoadingRca && (
+                    <button 
+                      onClick={() => handleRunRca(selectedInvocation.invocation_id)} 
+                      className={`rca-btn ${selectedInvocation.status === 'ERROR' ? 'error-btn' : ''}`}
+                    >
+                      {selectedInvocation.status === 'ERROR' ? 'Run Failure RCA' : 'Explain Execution Flow'}
+                    </button>
+                  )}
                 </div>
-              )}
 
-              {selectedLog.content_parts && selectedLog.content_parts.length > 0 && (
-                <div className="json-panel">
-                  <h4>Content Parts</h4>
-                  <pre className="code-block">
-                    {JSON.stringify(selectedLog.content_parts, null, 2)}
-                  </pre>
-                </div>
-              )}
+                {isLoadingRca && (
+                  <div className="rca-loading">
+                    <span className="spinner rca-spinner"></span>
+                    <span>Gemini is fetching trace logs and performing Root Cause Analysis...</span>
+                  </div>
+                )}
 
-              {selectedLog.attributes && (
-                <div className="json-panel">
-                  <h4>Plugin Attributes</h4>
-                  <pre className="code-block">
-                    {JSON.stringify(selectedLog.attributes, null, 2)}
-                  </pre>
-                </div>
-              )}
+                {rcaError && (
+                  <div className="error-banner" style={{ borderRadius: '6px', marginTop: '12px' }}>
+                    {rcaError}
+                  </div>
+                )}
+
+                {rcaExplanation && (
+                  <div className="rca-explanation-box markdown-body">
+                    {renderMarkdown(rcaExplanation)}
+                  </div>
+                )}
+
+                {!rcaExplanation && !isLoadingRca && !rcaError && (
+                  <p className="rca-placeholder">
+                    {selectedInvocation.status === 'ERROR' 
+                      ? 'This query execution failed. Click the button above to run Gemini AI Root Cause Analysis to pinpoint what went wrong and how to fix it.'
+                      : 'This query completed successfully. You can run the AI trace analysis above to review and optimize the tool execution steps.'}
+                  </p>
+                )}
+              </div>
+
+              {/* Raw Event Timeline */}
+              <div className="timeline-container">
+                <h4>Execution Timeline ({rawEvents.length} events)</h4>
+                {isLoadingEvents ? (
+                  <div className="timeline-loading">
+                    <span className="spinner"></span> Loading raw event sequence...
+                  </div>
+                ) : (
+                  <div className="timeline">
+                    {rawEvents.map((ev, evIdx) => (
+                      <div key={evIdx} className="timeline-item">
+                        <div className="timeline-dot"></div>
+                        <div className="timeline-content-wrapper">
+                          <div className="timeline-item-header">
+                            <span className={`badge ${getEventBadgeClass(ev.event_type)}`}>
+                              {ev.event_type}
+                            </span>
+                            <span className="timeline-time">
+                              {new Date(ev.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'})}
+                            </span>
+                            <span className={`badge ${ev.error_message ? 'badge-error' : 'badge-success'}`}>
+                              {ev.error_message ? 'ERROR' : ev.status || 'OK'}
+                            </span>
+                            <button 
+                              onClick={() => setExpandedEventId(expandedEventId === ev.span_id ? null : ev.span_id || String(evIdx))}
+                              className="btn-view-raw"
+                            >
+                              {expandedEventId === (ev.span_id || String(evIdx)) ? 'Hide Payload' : 'View Payload'}
+                            </button>
+                          </div>
+                          
+                          {ev.error_message && (
+                            <pre className="timeline-error">{ev.error_message}</pre>
+                          )}
+
+                          {expandedEventId === (ev.span_id || String(evIdx)) && (
+                            <div className="timeline-payload">
+                              {ev.content && (
+                                <div className="payload-sub-box">
+                                  <span>Payload Content</span>
+                                  <pre>{JSON.stringify(ev.content, null, 2)}</pre>
+                                </div>
+                              )}
+                              {ev.attributes && (
+                                <div className="payload-sub-box">
+                                  <span>Attributes</span>
+                                  <pre>{JSON.stringify(ev.attributes, null, 2)}</pre>
+                                </div>
+                              )}
+                              {ev.latency_ms && (
+                                <div className="payload-sub-box">
+                                  <span>Step Latency</span>
+                                  <pre>{JSON.stringify(ev.latency_ms, null, 2)}</pre>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -371,11 +558,12 @@ export const ObservabilityPage: React.FC = () => {
           display: flex;
           justify-content: space-between;
           align-items: center;
+          min-height: 100px;
         }
         .stat-info {
           display: flex;
           flex-direction: column;
-          gap: 6px;
+          gap: 4px;
         }
         .stat-title {
           font-size: 0.8rem;
@@ -389,6 +577,12 @@ export const ObservabilityPage: React.FC = () => {
           font-size: 1.8rem;
           font-weight: 700;
           color: var(--text-main);
+          line-height: 1.1;
+        }
+        .stat-sub-label {
+          font-size: 0.7rem;
+          color: var(--text-dim);
+          margin-top: 4px;
         }
         .stat-icon {
           width: 48px;
@@ -464,6 +658,8 @@ export const ObservabilityPage: React.FC = () => {
         .refresh-btn {
           font-size: 0.85rem;
           padding: 8px 16px;
+          display: flex;
+          align-items: center;
         }
         
         /* Table Wrapper */
@@ -509,11 +705,58 @@ export const ObservabilityPage: React.FC = () => {
           color: var(--text-dim);
           margin-top: 2px;
         }
-        .session-code, .trace-code {
+        .query-cell {
+          font-weight: 500;
+        }
+        .empty-sub {
+          color: var(--text-dim);
+          font-style: italic;
+          font-size: 0.8rem;
+        }
+        .session-code {
           font-family: var(--font-family-mono);
           font-size: 0.8rem;
           color: var(--text-muted);
         }
+
+        /* Token and Stage containers */
+        .token-metric {
+          display: flex;
+          flex-direction: column;
+        }
+        .token-sub {
+          font-size: 0.7rem;
+          color: var(--text-dim);
+          margin-top: 1px;
+        }
+        .stages-badge-container {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 4px;
+          max-width: 250px;
+        }
+        .stage-mini-badge {
+          font-size: 0.65rem;
+          padding: 2px 6px;
+          border-radius: 4px;
+          font-weight: 500;
+          letter-spacing: 0.02em;
+        }
+        .tools-badge-container {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 4px;
+        }
+        .tool-chip {
+          background: rgba(168, 85, 247, 0.1);
+          color: #c084fc;
+          border: 1px solid rgba(168, 85, 247, 0.2);
+          border-radius: 4px;
+          padding: 2px 6px;
+          font-size: 0.7rem;
+          font-family: var(--font-family-mono);
+        }
+
         .no-data {
           text-align: center;
           padding: 50px !important;
@@ -565,37 +808,43 @@ export const ObservabilityPage: React.FC = () => {
           border-top-color: white;
           animation: spin 1s ease-in-out infinite;
           display: inline-block;
-          margin-right: 6px;
         }
         @keyframes spin { to { transform: rotate(360deg); } }
 
-        /* Modal */
+        /* Modal / Detail Drawer */
         .modal-overlay {
           position: fixed;
           top: 0; left: 0; right: 0; bottom: 0;
-          background: rgba(0, 0, 0, 0.6);
+          background: rgba(0, 0, 0, 0.7);
           backdrop-filter: blur(8px);
           display: flex;
           align-items: center;
-          justify-content: center;
+          justify-content: flex-end; /* Drawer-style from right */
           z-index: 1000;
-          padding: 20px;
-          animation: fadeIn 0.25s ease forwards;
+          animation: fadeIn 0.2s ease forwards;
         }
         .modal-content {
           width: 100%;
-          max-width: 800px;
-          max-height: 90vh;
+          max-width: 850px;
+          height: 100vh;
           overflow-y: auto;
           display: flex;
           flex-direction: column;
           background: var(--bg-panel);
-          border: 1px solid rgba(255,255,255,0.1);
-          border-radius: 12px;
-          animation: slideInLeft 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+          border-left: 1px solid rgba(255,255,255,0.1);
+          border-radius: 0;
+          animation: slideInRight 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+        }
+        @keyframes slideInRight {
+          from { transform: translateX(100%); }
+          to { transform: translateX(0); }
+        }
+        @keyframes fadeIn {
+          from { opacity: 0; }
+          to { opacity: 1; }
         }
         .modal-header {
-          padding: 16px 24px;
+          padding: 20px 24px;
           border-bottom: 1px solid var(--border-glass);
           display: flex;
           justify-content: space-between;
@@ -603,27 +852,41 @@ export const ObservabilityPage: React.FC = () => {
         }
         .modal-header h3 {
           font-family: 'Outfit', sans-serif;
-          font-size: 1.1rem;
+          font-size: 1.25rem;
           color: var(--text-main);
+          font-weight: 600;
+        }
+        .invocation-sub-header {
+          font-size: 0.75rem;
+          color: var(--text-muted);
+          margin-top: 4px;
+          display: block;
         }
         .close-btn {
           background: transparent;
           border: none;
-          font-size: 1.5rem;
+          font-size: 1.8rem;
           color: var(--text-muted);
           cursor: pointer;
+          padding: 0 10px;
         }
         .close-btn:hover { color: var(--text-main); }
+        
         .modal-body {
           padding: 24px;
           display: flex;
           flex-direction: column;
-          gap: 20px;
+          gap: 24px;
         }
+        
         .details-grid {
           display: grid;
-          grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+          grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
           gap: 16px;
+          background: rgba(255,255,255,0.01);
+          border: 1px solid var(--border-glass);
+          border-radius: 8px;
+          padding: 16px;
         }
         .detail-item {
           display: flex;
@@ -634,48 +897,266 @@ export const ObservabilityPage: React.FC = () => {
           font-size: 0.75rem;
           color: var(--text-muted);
           font-weight: 500;
+          text-transform: uppercase;
+          letter-spacing: 0.02em;
         }
         .detail-val {
           font-size: 0.85rem;
           color: var(--text-main);
         }
-        .error-panel {
-          background: rgba(255, 0, 127, 0.05);
-          border: 1px solid rgba(255, 0, 127, 0.15);
-          border-radius: 8px;
-          padding: 16px;
+
+        /* Query & Response boxes */
+        .query-response-panel {
+          display: grid;
+          grid-template-columns: 1fr;
+          gap: 16px;
         }
-        .error-panel h4, .json-panel h4 {
-          font-size: 0.8rem;
-          color: var(--text-muted);
-          font-weight: 600;
-          text-transform: uppercase;
-          margin-bottom: 8px;
+        @media(min-width: 600px) {
+          .query-response-panel {
+            grid-template-columns: 1fr 1fr;
+          }
         }
-        .error-message {
-          color: var(--neon-pink);
-          font-family: var(--font-family-mono);
-          font-size: 0.8rem;
-          overflow-x: auto;
-          white-space: pre-wrap;
-        }
-        .json-panel {
-          display: flex;
-          flex-direction: column;
-        }
-        .code-block {
-          background: rgba(0, 0, 0, 0.3);
+        .qr-box {
           border: 1px solid var(--border-glass);
           border-radius: 8px;
           padding: 16px;
-          font-family: var(--font-family-mono);
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .qr-box h5 {
           font-size: 0.8rem;
+          color: var(--text-muted);
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+          margin: 0;
+          font-weight: 600;
+        }
+        .qr-box p {
+          font-size: 0.88rem;
+          color: var(--text-main);
+          margin: 0;
+          line-height: 1.5;
+          white-space: pre-wrap;
+        }
+        .qr-box.user-query {
+          background: rgba(0, 242, 254, 0.02);
+          border-color: rgba(0, 242, 254, 0.1);
+        }
+        .qr-box.agent-response {
+          background: rgba(255, 255, 255, 0.01);
+        }
+
+        /* RCA styles */
+        .rca-container {
+          padding: 20px;
+          background: rgba(168, 85, 247, 0.02);
+          border-color: rgba(168, 85, 247, 0.1);
+          border-radius: 10px;
+        }
+        .rca-header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 12px;
+        }
+        .rca-header h4 {
+          font-size: 0.95rem;
+          color: #c084fc;
+          font-weight: 600;
+          margin: 0;
+        }
+        .rca-btn {
+          background: rgba(168, 85, 247, 0.15);
+          color: #c084fc;
+          border: 1px solid rgba(168, 85, 247, 0.3);
+          border-radius: 6px;
+          padding: 6px 14px;
+          font-size: 0.8rem;
+          font-weight: 500;
+          cursor: pointer;
+          transition: all 0.2s;
+        }
+        .rca-btn:hover {
+          background: rgba(168, 85, 247, 0.25);
+          border-color: rgba(168, 85, 247, 0.5);
+          box-shadow: 0 0 8px rgba(168, 85, 247, 0.2);
+        }
+        .rca-btn.error-btn {
+          background: rgba(255, 0, 127, 0.15);
+          color: var(--neon-pink);
+          border-color: rgba(255, 0, 127, 0.3);
+        }
+        .rca-btn.error-btn:hover {
+          background: rgba(255, 0, 127, 0.25);
+          border-color: rgba(255, 0, 127, 0.5);
+          box-shadow: 0 0 8px rgba(255, 0, 127, 0.2);
+        }
+        .rca-loading {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 15px 0;
+          font-size: 0.85rem;
+          color: var(--text-muted);
+        }
+        .rca-spinner {
+          border-top-color: #c084fc;
+          width: 16px;
+          height: 16px;
+        }
+        .rca-placeholder {
+          font-size: 0.85rem;
+          color: var(--text-dim);
+          margin-top: 10px;
+          line-height: 1.5;
+        }
+        .rca-explanation-box {
+          margin-top: 16px;
+          background: rgba(0,0,0,0.25);
+          border: 1px solid rgba(168, 85, 247, 0.15);
+          border-radius: 8px;
+          padding: 18px;
+          color: var(--text-main);
+          font-size: 0.88rem;
+          line-height: 1.6;
+        }
+        
+        /* Custom Markdown styling for RCA */
+        .rca-h3 { font-size: 1.15rem; color: #c084fc; font-weight: 600; margin-top: 0; margin-bottom: 12px; border-bottom: 1px solid rgba(168,85,247,0.2); padding-bottom: 4px; }
+        .rca-h4 { font-size: 1rem; color: var(--text-main); font-weight: 600; margin-top: 16px; margin-bottom: 8px; }
+        .rca-h5 { font-size: 0.9rem; color: var(--text-main); font-weight: 600; margin-top: 14px; margin-bottom: 6px; }
+        .rca-p { margin: 0 0 10px 0; }
+        .rca-li { margin-left: 18px; margin-bottom: 6px; list-style-type: square; }
+        .rca-blockquote { margin: 12px 0; padding: 8px 16px; border-left: 3px solid #c084fc; background: rgba(168,85,247,0.05); color: var(--text-muted); font-style: italic; }
+
+        /* Timeline / Trace progression */
+        .timeline-container {
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+        }
+        .timeline-container h4 {
+          font-size: 0.9rem;
+          color: var(--text-main);
+          font-weight: 600;
+          margin: 0;
+          text-transform: uppercase;
+          letter-spacing: 0.05em;
+        }
+        .timeline-loading {
+          font-size: 0.85rem;
+          color: var(--text-dim);
+          padding: 20px 0;
+        }
+        .timeline {
+          position: relative;
+          padding-left: 20px;
+          margin-top: 10px;
+        }
+        .timeline::before {
+          content: '';
+          position: absolute;
+          top: 4px; left: 4px; bottom: 4px;
+          width: 2px;
+          background: var(--border-glass);
+        }
+        .timeline-item {
+          position: relative;
+          margin-bottom: 18px;
+        }
+        .timeline-dot {
+          position: absolute;
+          top: 6px; left: -20px;
+          width: 10px; height: 10px;
+          border-radius: 50%;
+          background: var(--neon-cyan);
+          box-shadow: 0 0 8px var(--neon-cyan);
+          border: 2px solid var(--bg-panel);
+          transition: all 0.3s;
+        }
+        .timeline-item:hover .timeline-dot {
+          transform: scale(1.3);
+        }
+        .timeline-content-wrapper {
+          background: rgba(255,255,255,0.01);
+          border: 1px solid var(--border-glass);
+          border-radius: 6px;
+          padding: 10px 14px;
+          transition: all 0.2s;
+        }
+        .timeline-content-wrapper:hover {
+          border-color: rgba(255,255,255,0.15);
+          background: rgba(255,255,255,0.02);
+        }
+        .timeline-item-header {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          flex-wrap: wrap;
+        }
+        .timeline-time {
+          font-size: 0.75rem;
+          color: var(--text-dim);
+          font-family: var(--font-family-mono);
+        }
+        .btn-view-raw {
+          background: transparent;
+          border: none;
+          color: var(--neon-cyan);
+          font-size: 0.75rem;
+          cursor: pointer;
+          padding: 2px 6px;
+          margin-left: auto;
+          text-decoration: underline;
+        }
+        .btn-view-raw:hover {
+          color: #818cf8;
+        }
+        .timeline-error {
+          margin-top: 8px;
+          background: rgba(255, 0, 127, 0.05);
+          border: 1px solid rgba(255, 0, 127, 0.15);
+          color: var(--neon-pink);
+          border-radius: 4px;
+          padding: 8px 12px;
+          font-family: var(--font-family-mono);
+          font-size: 0.75rem;
+          white-space: pre-wrap;
+        }
+        .timeline-payload {
+          margin-top: 10px;
+          display: flex;
+          flex-direction: column;
+          gap: 10px;
+          border-top: 1px dashed var(--border-glass);
+          padding-top: 10px;
+        }
+        .payload-sub-box {
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+        }
+        .payload-sub-box span {
+          font-size: 0.7rem;
+          color: var(--text-muted);
+          font-weight: 500;
+          text-transform: uppercase;
+        }
+        .payload-sub-box pre {
+          background: rgba(0,0,0,0.4);
+          border: 1px solid var(--border-glass);
+          border-radius: 4px;
+          padding: 10px;
+          font-family: var(--font-family-mono);
+          font-size: 0.75rem;
           color: var(--text-main);
           overflow-x: auto;
           white-space: pre-wrap;
-          max-height: 250px;
+          max-height: 180px;
         }
-        
+
         .badge-warning {
           background: rgba(245, 158, 11, 0.1);
           color: #f59e0b;
